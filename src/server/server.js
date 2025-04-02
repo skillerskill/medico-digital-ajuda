@@ -5,6 +5,8 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const routes = require('./routes/index');
 const db = require('./config/db');
+const bcryptjs = require('bcryptjs');
+const jsonwebtoken = require('jsonwebtoken');
 
 // Configuração de variáveis de ambiente
 dotenv.config();

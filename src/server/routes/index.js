@@ -1,482 +1,360 @@
 
-// Arquivo unificado de rotas
+// Arquivo de rotas unificado
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { pool } = require('../config/db');
-
 const router = express.Router();
+const db = require('../config/db');
 
 // Middleware de autenticação
-const verifyToken = (req, res, next) => {
-  const token = req.headers['x-access-token'] || req.headers['authorization'];
-  
-  if (!token) {
-    return res.status(403).send({
-      message: "Nenhum token fornecido!"
-    });
-  }
-
-  // Remove 'Bearer ' do token se existir
-  const tokenValue = token.startsWith('Bearer ') ? token.slice(7) : token;
-  
+const authenticate = async (req, res, next) => {
   try {
-    const decoded = jwt.verify(tokenValue, process.env.JWT_SECRET || 'sua_chave_secreta');
-    req.userId = decoded.id;
-    req.userRole = decoded.role;
-    next();
-  } catch (error) {
-    return res.status(401).send({
-      message: "Não autorizado!"
-    });
-  }
-};
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: 'Token de autenticação não fornecido' });
+    }
 
-const isAdmin = (req, res, next) => {
-  if (req.userRole === 'admin') {
-    next();
-  } else {
-    res.status(403).send({
-      message: "Requer privilégios de administrador!"
-    });
-  }
-};
-
-// ================ ROTAS DE AUTENTICAÇÃO ================
-
-// Rota de registro de usuários (pacientes)
-router.post('/auth/register', async (req, res) => {
-  try {
-    const { name, email, password, phone } = req.body;
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'sua_chave_secreta');
     
-    // Verificar se o email já existe
-    const [existingUsers] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-    
-    if (existingUsers.length > 0) {
-      return res.status(400).send({ message: "Email já está em uso!" });
+    // Busca o usuário na base
+    const [users] = await db.pool.query('SELECT * FROM users WHERE id = ?', [decoded.id]);
+    if (users.length === 0) {
+      return res.status(401).json({ message: 'Usuário não encontrado' });
     }
     
-    // Hash da senha
-    const hashedPassword = bcrypt.hashSync(password, 10);
+    const user = users[0];
+    delete user.password; // Remove a senha do objeto antes de passar adiante
     
-    // Inserir novo usuário
-    const [result] = await pool.query(
-      'INSERT INTO users (name, email, password, phone) VALUES (?, ?, ?, ?)',
-      [name, email, hashedPassword, phone]
-    );
-    
-    // Gerar token JWT
-    const token = jwt.sign(
-      { id: result.insertId, role: 'patient' },
-      process.env.JWT_SECRET || 'sua_chave_secreta',
-      { expiresIn: '24h' }
-    );
-    
-    res.status(201).send({
-      message: "Usuário registrado com sucesso!",
-      user: {
-        id: result.insertId,
-        name,
-        email,
-        role: 'patient'
-      },
-      token
-    });
+    req.user = user;
+    next();
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao registrar usuário" });
+    console.error('Erro de autenticação:', error);
+    return res.status(401).json({ message: 'Token inválido ou expirado' });
   }
-});
+};
 
-// Rota de login
+// Middleware para verificar permissões de admin
+const isAdmin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') {
+    next();
+  } else {
+    res.status(403).json({ message: 'Acesso negado: permissões de administrador necessárias' });
+  }
+};
+
+// Rota para login
 router.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    // Verificar usuários normais
-    const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    // Verifica credenciais de usuário (paciente)
+    const [users] = await db.pool.query('SELECT * FROM users WHERE email = ?', [email]);
     
-    if (users.length > 0) {
-      const user = users[0];
-      const passwordIsValid = bcrypt.compareSync(password, user.password);
-      
-      if (!passwordIsValid) {
-        return res.status(401).send({ message: "Senha inválida!" });
+    // Verifica credenciais de médico se não encontrar como usuário
+    let user = null;
+    let isDoctor = false;
+    
+    if (users.length === 0) {
+      const [doctors] = await db.pool.query('SELECT * FROM doctors WHERE email = ?', [email]);
+      if (doctors.length > 0) {
+        user = doctors[0];
+        isDoctor = true;
       }
-      
-      const token = jwt.sign(
-        { id: user.id, role: user.role },
-        process.env.JWT_SECRET || 'sua_chave_secreta',
-        { expiresIn: '24h' }
-      );
-      
-      return res.status(200).send({
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role
-        },
-        token
-      });
+    } else {
+      user = users[0];
     }
     
-    // Verificar médicos
-    const [doctors] = await pool.query('SELECT * FROM doctors WHERE email = ?', [email]);
-    
-    if (doctors.length > 0) {
-      const doctor = doctors[0];
-      const passwordIsValid = bcrypt.compareSync(password, doctor.password);
-      
-      if (!passwordIsValid) {
-        return res.status(401).send({ message: "Senha inválida!" });
-      }
-      
-      const token = jwt.sign(
-        { id: doctor.id, role: 'doctor' },
-        process.env.JWT_SECRET || 'sua_chave_secreta',
-        { expiresIn: '24h' }
-      );
-      
-      return res.status(200).send({
-        user: {
-          id: doctor.id,
-          name: doctor.name,
-          email: doctor.email,
-          role: 'doctor',
-          specialty_id: doctor.specialty_id
-        },
-        token
-      });
+    if (!user) {
+      return res.status(401).json({ message: 'Email ou senha incorretos' });
     }
     
-    return res.status(404).send({ message: "Usuário não encontrado!" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro no servidor" });
-  }
-});
-
-// Rota para obter informações do usuário atual
-router.get('/auth/me', verifyToken, async (req, res) => {
-  try {
-    // Verificar se é um usuário normal
-    const [users] = await pool.query('SELECT id, name, email, role, phone, created_at FROM users WHERE id = ?', [req.userId]);
-    
-    if (users.length > 0) {
-      return res.status(200).send(users[0]);
+    // Verifica a senha
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: 'Email ou senha incorretos' });
     }
     
-    // Verificar se é um médico
-    const [doctors] = await pool.query(
-      'SELECT d.id, d.name, d.email, "doctor" as role, d.specialty_id, d.crm, d.phone, d.bio, d.profile_image, s.name as specialty_name FROM doctors d JOIN specialties s ON d.specialty_id = s.id WHERE d.id = ?',
-      [req.userId]
+    // Remove a senha antes de enviar
+    const userResponse = { ...user };
+    delete userResponse.password;
+    
+    // Adiciona o tipo de papel do usuário
+    userResponse.role = isDoctor ? 'doctor' : user.role;
+    
+    // Gera o token JWT
+    const token = jwt.sign(
+      { id: user.id, role: userResponse.role },
+      process.env.JWT_SECRET || 'sua_chave_secreta',
+      { expiresIn: '24h' }
     );
     
-    if (doctors.length > 0) {
-      return res.status(200).send(doctors[0]);
+    res.json({ user: userResponse, token });
+    
+  } catch (error) {
+    console.error('Erro no login:', error);
+    res.status(500).json({ message: 'Erro ao processar login' });
+  }
+});
+
+// Rota para registro de usuários (pacientes)
+router.post('/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, cpf, phone } = req.body;
+    
+    // Verificar se o email já está em uso (em ambas as tabelas)
+    const [existingUsers] = await db.pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    const [existingDoctors] = await db.pool.query('SELECT * FROM doctors WHERE email = ?', [email]);
+    
+    if (existingUsers.length > 0 || existingDoctors.length > 0) {
+      return res.status(400).json({ message: 'Este email já está em uso' });
     }
     
-    return res.status(404).send({ message: "Usuário não encontrado!" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro no servidor" });
-  }
-});
-
-// ================ ROTAS DE MÉDICOS ================
-
-// Obter todos os médicos (público)
-router.get('/doctors', async (req, res) => {
-  try {
-    const [doctors] = await pool.query(
-      'SELECT d.id, d.name, d.email, d.specialty_id, d.crm, d.phone, d.bio, d.profile_image, d.consultation_price, s.name as specialty_name FROM doctors d JOIN specialties s ON d.specialty_id = s.id WHERE d.active = 1'
-    );
-    
-    res.status(200).send(doctors);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar médicos" });
-  }
-});
-
-// Obter médico por ID (público)
-router.get('/doctors/:id', async (req, res) => {
-  try {
-    const [doctors] = await pool.query(
-      'SELECT d.id, d.name, d.email, d.specialty_id, d.crm, d.phone, d.bio, d.profile_image, d.consultation_price, s.name as specialty_name FROM doctors d JOIN specialties s ON d.specialty_id = s.id WHERE d.id = ? AND d.active = 1',
-      [req.params.id]
-    );
-    
-    if (doctors.length === 0) {
-      return res.status(404).send({ message: "Médico não encontrado" });
+    // Verificar se o CPF já está cadastrado
+    const [existingCpf] = await db.pool.query('SELECT * FROM users WHERE cpf = ?', [cpf]);
+    if (existingCpf.length > 0) {
+      return res.status(400).json({ message: 'Este CPF já está cadastrado' });
     }
     
-    res.status(200).send(doctors[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar médico" });
-  }
-});
-
-// Obter médicos por especialidade (público)
-router.get('/doctors/specialty/:id', async (req, res) => {
-  try {
-    const [doctors] = await pool.query(
-      'SELECT d.id, d.name, d.email, d.specialty_id, d.crm, d.phone, d.bio, d.profile_image, d.consultation_price, s.name as specialty_name FROM doctors d JOIN specialties s ON d.specialty_id = s.id WHERE d.specialty_id = ? AND d.active = 1',
-      [req.params.id]
+    // Criptografar a senha
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+    
+    // Inserir o novo usuário
+    const [result] = await db.pool.query(
+      'INSERT INTO users (name, email, password, cpf, phone, role) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, email, hashedPassword, cpf, phone, 'patient']
     );
     
-    res.status(200).send(doctors);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar médicos por especialidade" });
-  }
-});
-
-// Adicionar um novo médico (apenas admin)
-router.post('/doctors', [verifyToken, isAdmin], async (req, res) => {
-  try {
-    const { name, email, password, specialty_id, crm, phone, bio, consultation_price } = req.body;
+    // Buscar o usuário recém-criado
+    const [users] = await db.pool.query('SELECT * FROM users WHERE id = ?', [result.insertId]);
+    const user = users[0];
+    delete user.password;
     
-    // Verificar se o email já existe
-    const [existingDoctors] = await pool.query('SELECT * FROM doctors WHERE email = ? OR crm = ?', [email, crm]);
-    
-    if (existingDoctors.length > 0) {
-      return res.status(400).send({ message: "Email ou CRM já está em uso!" });
-    }
-    
-    // Hash da senha
-    const hashedPassword = bcrypt.hashSync(password, 10);
-    
-    // Inserir novo médico
-    const [result] = await pool.query(
-      'INSERT INTO doctors (name, email, password, specialty_id, crm, phone, bio, consultation_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [name, email, hashedPassword, specialty_id, crm, phone, bio, consultation_price]
+    // Gerar token JWT
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      process.env.JWT_SECRET || 'sua_chave_secreta',
+      { expiresIn: '24h' }
     );
     
-    res.status(201).send({
-      message: "Médico adicionado com sucesso!",
-      doctor: {
-        id: result.insertId,
-        name,
-        email,
-        specialty_id,
-        crm
-      }
-    });
+    res.status(201).json({ user, token });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao adicionar médico" });
+    console.error('Erro no registro:', error);
+    res.status(500).json({ message: 'Erro ao processar registro' });
   }
 });
 
-// Atualizar médico (apenas admin)
-router.put('/doctors/:id', [verifyToken, isAdmin], async (req, res) => {
-  try {
-    const { name, email, specialty_id, crm, phone, bio, consultation_price, active } = req.body;
-    
-    // Verificar se o médico existe
-    const [existingDoctors] = await pool.query('SELECT * FROM doctors WHERE id = ?', [req.params.id]);
-    
-    if (existingDoctors.length === 0) {
-      return res.status(404).send({ message: "Médico não encontrado" });
-    }
-    
-    // Atualizar médico
-    await pool.query(
-      'UPDATE doctors SET name = ?, email = ?, specialty_id = ?, crm = ?, phone = ?, bio = ?, consultation_price = ?, active = ? WHERE id = ?',
-      [name, email, specialty_id, crm, phone, bio, consultation_price, active, req.params.id]
-    );
-    
-    res.status(200).send({ message: "Médico atualizado com sucesso!" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao atualizar médico" });
-  }
+// Rota para obter perfil do usuário logado
+router.get('/auth/me', authenticate, (req, res) => {
+  res.json({ user: req.user });
 });
 
-// Remover médico (apenas admin)
-router.delete('/doctors/:id', [verifyToken, isAdmin], async (req, res) => {
-  try {
-    // Verificar se o médico existe
-    const [existingDoctors] = await pool.query('SELECT * FROM doctors WHERE id = ?', [req.params.id]);
-    
-    if (existingDoctors.length === 0) {
-      return res.status(404).send({ message: "Médico não encontrado" });
-    }
-    
-    // Desativar médico em vez de excluir (soft delete)
-    await pool.query('UPDATE doctors SET active = 0 WHERE id = ?', [req.params.id]);
-    
-    res.status(200).send({ message: "Médico removido com sucesso!" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao remover médico" });
-  }
-});
-
-// Obter todas as especialidades (público)
+// Rota para obter todas as especialidades médicas
 router.get('/specialties', async (req, res) => {
   try {
-    const [specialties] = await pool.query('SELECT * FROM specialties');
-    res.status(200).send(specialties);
+    const [specialties] = await db.pool.query('SELECT * FROM specialties');
+    res.json(specialties);
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar especialidades" });
+    console.error('Erro ao buscar especialidades:', error);
+    res.status(500).json({ message: 'Erro ao buscar especialidades' });
   }
 });
 
-// ================ ROTAS DE CONSULTAS ================
+// Rota para obter médicos por especialidade
+router.get('/doctors/specialty/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [doctors] = await db.pool.query(
+      'SELECT d.id, d.name, d.specialty_id, d.crm, d.bio, d.profile_image, d.consultation_price, s.name AS specialty_name ' +
+      'FROM doctors d ' +
+      'JOIN specialties s ON d.specialty_id = s.id ' +
+      'WHERE d.specialty_id = ? AND d.active = true',
+      [id]
+    );
+    res.json(doctors);
+  } catch (error) {
+    console.error('Erro ao buscar médicos:', error);
+    res.status(500).json({ message: 'Erro ao buscar médicos' });
+  }
+});
 
-// Criar nova consulta (usuário autenticado)
-router.post('/appointments', verifyToken, async (req, res) => {
+// Rota para agendar consulta
+router.post('/appointments', authenticate, async (req, res) => {
   try {
     const { doctor_id, scheduled_date, notes } = req.body;
-    const patient_id = req.userId;
+    const patient_id = req.user.id;
     
-    // Verificar se o médico existe e está ativo
-    const [doctors] = await pool.query('SELECT * FROM doctors WHERE id = ? AND active = 1', [doctor_id]);
-    
-    if (doctors.length === 0) {
-      return res.status(404).send({ message: "Médico não encontrado ou inativo" });
-    }
-    
-    // Verificar disponibilidade do horário
-    const [existingAppointments] = await pool.query(
-      'SELECT * FROM appointments WHERE doctor_id = ? AND scheduled_date = ? AND status NOT IN ("canceled")',
+    // Verifica se o horário está disponível
+    const [existingAppointments] = await db.pool.query(
+      'SELECT * FROM appointments WHERE doctor_id = ? AND scheduled_date = ? AND status != "canceled"',
       [doctor_id, scheduled_date]
     );
     
     if (existingAppointments.length > 0) {
-      return res.status(400).send({ message: "Horário indisponível" });
+      return res.status(400).json({ message: 'Este horário não está disponível' });
     }
     
-    // Inserir nova consulta
-    const [result] = await pool.query(
+    // Cria o agendamento
+    const [result] = await db.pool.query(
       'INSERT INTO appointments (patient_id, doctor_id, scheduled_date, notes) VALUES (?, ?, ?, ?)',
       [patient_id, doctor_id, scheduled_date, notes]
     );
     
-    res.status(201).send({
-      message: "Consulta agendada com sucesso!",
-      appointment: {
-        id: result.insertId,
-        patient_id,
-        doctor_id,
-        scheduled_date,
-        status: 'pending'
-      }
+    res.status(201).json({ 
+      id: result.insertId, 
+      patient_id, 
+      doctor_id, 
+      scheduled_date, 
+      notes,
+      status: 'pending',
+      payment_status: 'pending'
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao agendar consulta" });
+    console.error('Erro ao agendar consulta:', error);
+    res.status(500).json({ message: 'Erro ao agendar consulta' });
   }
 });
 
-// Obter consultas do paciente (usuário autenticado)
-router.get('/appointments/my-appointments', verifyToken, async (req, res) => {
+// Rota para listar consultas do paciente
+router.get('/patient/appointments', authenticate, async (req, res) => {
   try {
-    const [appointments] = await pool.query(
-      `SELECT a.*, d.name as doctor_name, d.profile_image as doctor_image, s.name as specialty 
-       FROM appointments a 
-       JOIN doctors d ON a.doctor_id = d.id 
-       JOIN specialties s ON d.specialty_id = s.id 
-       WHERE a.patient_id = ? 
-       ORDER BY a.scheduled_date DESC`,
-      [req.userId]
+    const [appointments] = await db.pool.query(
+      'SELECT a.*, d.name AS doctor_name, d.profile_image AS doctor_image, s.name AS specialty ' +
+      'FROM appointments a ' +
+      'JOIN doctors d ON a.doctor_id = d.id ' +
+      'JOIN specialties s ON d.specialty_id = s.id ' +
+      'WHERE a.patient_id = ? ' +
+      'ORDER BY a.scheduled_date DESC',
+      [req.user.id]
     );
     
-    res.status(200).send(appointments);
+    res.json(appointments);
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar consultas" });
+    console.error('Erro ao listar consultas:', error);
+    res.status(500).json({ message: 'Erro ao listar consultas' });
   }
 });
 
-// Cancelar consulta (usuário autenticado)
-router.put('/appointments/:id/cancel', verifyToken, async (req, res) => {
+// ROTAS DE ADMINISTRAÇÃO
+
+// Rota para listar médicos (admin)
+router.get('/admin/doctors', authenticate, isAdmin, async (req, res) => {
   try {
-    // Verificar se a consulta existe e pertence ao usuário
-    const [appointments] = await pool.query(
-      'SELECT * FROM appointments WHERE id = ? AND patient_id = ?',
-      [req.params.id, req.userId]
+    const [doctors] = await db.pool.query(
+      'SELECT d.*, s.name AS specialty_name ' +
+      'FROM doctors d ' +
+      'JOIN specialties s ON d.specialty_id = s.id'
     );
     
-    if (appointments.length === 0) {
-      return res.status(404).send({ message: "Consulta não encontrada" });
+    // Remove as senhas dos resultados
+    doctors.forEach(doctor => delete doctor.password);
+    
+    res.json(doctors);
+  } catch (error) {
+    console.error('Erro ao listar médicos:', error);
+    res.status(500).json({ message: 'Erro ao listar médicos' });
+  }
+});
+
+// Rota para adicionar médico (admin)
+router.post('/admin/doctors', authenticate, isAdmin, async (req, res) => {
+  try {
+    const { name, email, specialty_id, crm, phone, bio, consultation_price } = req.body;
+    
+    // Verifica se o email já está em uso
+    const [existingUsers] = await db.pool.query('SELECT * FROM users WHERE email = ? UNION SELECT * FROM doctors WHERE email = ?', [email, email]);
+    if (existingUsers.length > 0) {
+      return res.status(400).json({ message: 'Este email já está em uso' });
     }
     
-    // Verificar se a consulta já foi cancelada ou realizada
-    if (['canceled', 'completed'].includes(appointments[0].status)) {
-      return res.status(400).send({ message: `Não é possível cancelar uma consulta ${appointments[0].status === 'canceled' ? 'já cancelada' : 'já realizada'}` });
+    // Verifica se o CRM já está cadastrado
+    const [existingCrm] = await db.pool.query('SELECT * FROM doctors WHERE crm = ?', [crm]);
+    if (existingCrm.length > 0) {
+      return res.status(400).json({ message: 'Este CRM já está cadastrado' });
     }
     
-    // Cancelar consulta
-    await pool.query(
-      'UPDATE appointments SET status = "canceled" WHERE id = ?',
-      [req.params.id]
+    // Gera uma senha padrão inicial
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash('medico123', salt); // Senha padrão inicial que o médico deve alterar no primeiro login
+    
+    // Insere o novo médico
+    const [result] = await db.pool.query(
+      'INSERT INTO doctors (name, email, password, specialty_id, crm, phone, bio, consultation_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, email, hashedPassword, specialty_id, crm, phone, bio, consultation_price]
     );
     
-    res.status(200).send({ message: "Consulta cancelada com sucesso!" });
+    // Busca o médico recém-criado
+    const [doctors] = await db.pool.query('SELECT * FROM doctors WHERE id = ?', [result.insertId]);
+    const doctor = doctors[0];
+    delete doctor.password;
+    
+    res.status(201).json(doctor);
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao cancelar consulta" });
+    console.error('Erro ao adicionar médico:', error);
+    res.status(500).json({ message: 'Erro ao adicionar médico' });
   }
 });
 
-// Obter consultas do médico (médico autenticado)
-router.get('/appointments/doctor-appointments', verifyToken, async (req, res) => {
+// Rota para editar médico (admin)
+router.put('/admin/doctors/:id', authenticate, isAdmin, async (req, res) => {
   try {
-    // Verificar se o usuário é um médico
-    const [doctors] = await pool.query('SELECT * FROM doctors WHERE id = ?', [req.userId]);
+    const { id } = req.params;
+    const { name, specialty_id, crm, phone, bio, consultation_price, active } = req.body;
+    
+    // Atualiza os dados do médico
+    await db.pool.query(
+      'UPDATE doctors SET name = ?, specialty_id = ?, crm = ?, phone = ?, bio = ?, consultation_price = ?, active = ? WHERE id = ?',
+      [name, specialty_id, crm, phone, bio, consultation_price, active, id]
+    );
+    
+    // Busca o médico atualizado
+    const [doctors] = await db.pool.query('SELECT * FROM doctors WHERE id = ?', [id]);
     
     if (doctors.length === 0) {
-      return res.status(403).send({ message: "Acesso restrito a médicos" });
+      return res.status(404).json({ message: 'Médico não encontrado' });
     }
     
-    const [appointments] = await pool.query(
-      `SELECT a.*, u.name as patient_name, u.phone as patient_phone 
-       FROM appointments a 
-       JOIN users u ON a.patient_id = u.id 
-       WHERE a.doctor_id = ? 
-       ORDER BY a.scheduled_date ASC`,
-      [req.userId]
-    );
+    const doctor = doctors[0];
+    delete doctor.password;
     
-    res.status(200).send(appointments);
+    res.json(doctor);
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao buscar consultas" });
+    console.error('Erro ao editar médico:', error);
+    res.status(500).json({ message: 'Erro ao editar médico' });
   }
 });
 
-// Atualizar status da consulta (médico autenticado)
-router.put('/appointments/:id/status', verifyToken, async (req, res) => {
+// Rota para excluir médico (admin)
+router.delete('/admin/doctors/:id', authenticate, isAdmin, async (req, res) => {
   try {
-    const { status, notes } = req.body;
+    const { id } = req.params;
     
-    // Verificar se a consulta existe e pertence ao médico
-    const [appointments] = await pool.query(
-      'SELECT * FROM appointments WHERE id = ? AND doctor_id = ?',
-      [req.params.id, req.userId]
+    // Verifica se existem consultas marcadas para este médico
+    const [appointments] = await db.pool.query(
+      'SELECT * FROM appointments WHERE doctor_id = ? AND status IN ("pending", "confirmed")',
+      [id]
     );
     
-    if (appointments.length === 0) {
-      return res.status(404).send({ message: "Consulta não encontrada" });
+    if (appointments.length > 0) {
+      return res.status(400).json({ 
+        message: 'Não é possível excluir este médico, pois existem consultas marcadas.' 
+      });
     }
     
-    // Atualizar status da consulta
-    await pool.query(
-      'UPDATE appointments SET status = ?, notes = ? WHERE id = ?',
-      [status, notes, req.params.id]
-    );
+    // Exclui o médico
+    await db.pool.query('DELETE FROM doctors WHERE id = ?', [id]);
     
-    res.status(200).send({ message: "Status da consulta atualizado com sucesso!" });
+    res.json({ message: 'Médico excluído com sucesso' });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Erro ao atualizar status da consulta" });
+    console.error('Erro ao excluir médico:', error);
+    res.status(500).json({ message: 'Erro ao excluir médico' });
   }
+});
+
+// Rota padrão para teste
+router.get('/', (req, res) => {
+  res.json({ message: 'API de telemedicina online funcionando!' });
 });
 
 module.exports = router;
