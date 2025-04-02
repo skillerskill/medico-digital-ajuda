@@ -3,9 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const authRoutes = require('./routes/auth.routes');
-const doctorRoutes = require('./routes/doctor.routes');
-const appointmentRoutes = require('./routes/appointment.routes');
+const routes = require('./routes/index');
 const db = require('./config/db');
 
 // Configuração de variáveis de ambiente
@@ -25,9 +23,7 @@ db.getConnection()
   .catch(err => console.error('Erro ao conectar com o MySQL:', err));
 
 // Rotas
-app.use('/api/auth', authRoutes);
-app.use('/api/doctors', doctorRoutes);
-app.use('/api/appointments', appointmentRoutes);
+app.use('/api', routes);
 
 // Rota padrão
 app.get('/', (req, res) => {
